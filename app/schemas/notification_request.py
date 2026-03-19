@@ -4,19 +4,18 @@ from app.models.notification import (
     NotificationChannel,
     NotificationPriority,
     SourceService,
+    EventType,
 )
 
 
 class NotificationCreate(BaseModel):
     idempotency_key: str
     source_service: str        # "order" | "payment" | "shipping"
-    event_type: str            # "order.created" | "payment.failed" etc
+    event_type: str            # "order_created" | "payment_failed" etc
     channel: str               # "email" | "sms" | "push"
-    recipient: str             # email / phone number / device token
-    subject: Optional[str] = None   # email only
-    body: str
-    priority: int = NotificationPriority.MEDIUM
-    metadata: Optional[dict] = {}
+    recipient: str
+    priority: str = "medium"   # "critical" | "high" | "medium" | "low"
+    content: dict              # channel specific content
 
     @field_validator("channel")
     @classmethod
@@ -34,16 +33,31 @@ class NotificationCreate(BaseModel):
             raise ValueError(f"source_service must be one of {allowed}")
         return v.lower()
 
+    @field_validator("event_type")
+    @classmethod
+    def validate_event_type(cls, v):
+        allowed = {e.name.lower() for e in EventType}
+        if v.lower() not in allowed:
+            raise ValueError(f"event_type must be one of {allowed}")
+        return v.lower()
+
     @field_validator("priority")
     @classmethod
     def validate_priority(cls, v):
-        valid = {p.value for p in NotificationPriority}
-        if v not in valid:
-            raise ValueError(f"priority must be one of {valid}")
-        return v
+        allowed = {p.name.lower() for p in NotificationPriority}
+        if v.lower() not in allowed:
+            raise ValueError(f"priority must be one of {allowed}")
+        return v.lower()
 
+    # helpers to convert strings to integers for DB storage
     def channel_as_int(self) -> int:
         return NotificationChannel[self.channel.upper()].value
 
     def source_service_as_int(self) -> int:
         return SourceService[self.source_service.upper()].value
+
+    def event_type_as_int(self) -> int:
+        return EventType[self.event_type.upper()].value
+
+    def priority_as_int(self) -> int:
+        return NotificationPriority[self.priority.upper()].value

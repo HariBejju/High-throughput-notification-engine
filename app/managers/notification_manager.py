@@ -1,12 +1,18 @@
-import uuid
 import logging
+from typing import Optional, List
 
 import redis.asyncio as aioredis
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.models.notification import Notification, NotificationStatus
+from app.models.notification import (
+    Notification,
+    NotificationStatus,
+    NotificationChannel,
+    SourceService,
+    EventType,
+)
 from app.repositories.notification_repository import NotificationRepository
 from app.schemas.notification_request import NotificationCreate
 
@@ -23,10 +29,11 @@ class NotificationManager:
         self.db = db
         self.repository = NotificationRepository(db)
 
-    async def create_notification(self, payload: NotificationCreate) -> tuple[Notification | None, bool]:
+    async def create_notification(
+        self, payload: NotificationCreate
+    ) -> tuple[Optional[Notification], bool]:
         """
         Returns (notification, is_duplicate)
-        is_duplicate = True means same idempotency key already processed
         """
         # Step 1 — fast idempotency check via Redis
         redis_key = f"idem:{payload.idempotency_key}"
@@ -36,22 +43,18 @@ class NotificationManager:
             logger.info("Duplicate blocked by Redis: %s", payload.idempotency_key)
             return None, True
 
-        # set expiry after successful setnx
         await redis_client.expire(redis_key, IDEMPOTENCY_EXPIRY)
 
-        # Step 2 — build notification object
+        # Step 2 — build notification with integers for DB
         notification = Notification(
-            id=uuid.uuid4(),
             idempotency_key=payload.idempotency_key,
             source_service=payload.source_service_as_int(),
-            event_type=payload.event_type,
+            event_type=payload.event_type_as_int(),
             channel=payload.channel_as_int(),
             recipient=payload.recipient,
-            subject=payload.subject,
-            body=payload.body,
-            priority=payload.priority,
+            priority=payload.priority_as_int(),
             status=NotificationStatus.PENDING,
-            metadata_=payload.metadata,
+            content=payload.content,
         )
 
         # Step 3 — persist to DB
@@ -61,27 +64,63 @@ class NotificationManager:
             return saved, False
 
         except IntegrityError:
-            # PostgreSQL unique constraint caught duplicate Redis missed
             await self.db.rollback()
             await redis_client.delete(redis_key)
             logger.warning("Duplicate caught by DB: %s", payload.idempotency_key)
             return None, True
 
-    async def get_notification(self, notification_id: uuid.UUID):
+    async def get_notification(self, notification_id: int) -> Optional[Notification]:
         return await self.repository.get_by_id(notification_id)
 
     async def list_notifications(
         self,
-        status=None,
-        channel=None,
-        source_service=None,
-        limit=20,
-        offset=0,
-    ):
+        status: Optional[str] = None,
+        channel: Optional[str] = None,
+        source_service: Optional[str] = None,
+        event_type: Optional[str] = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> List[Notification]:
+        # convert string filters to integers for DB query
+        status_int = NotificationStatus[status.upper()].value if status else None
+        channel_int = NotificationChannel[channel.upper()].value if channel else None
+        source_int = SourceService[source_service.upper()].value if source_service else None
+        event_int = EventType[event_type.upper()].value if event_type else None
+
         return await self.repository.list(
-            status=status,
-            channel=channel,
-            source_service=source_service,
+            status=status_int,
+            channel=channel_int,
+            source_service=source_int,
+            event_type=event_int,
             limit=limit,
             offset=offset,
         )
+
+    async def retry_notification(
+        self, notification_id: int
+    ) -> tuple[Optional[Notification], str]:
+        """
+        Returns (notification, error_message)
+        error_message is empty string if successful
+        """
+        notification = await self.repository.get_by_id(notification_id)
+
+        if not notification:
+            return None, "Notification not found"
+
+        if notification.status == NotificationStatus.SENT:
+            return None, "Cannot retry a notification with status sent"
+
+        if notification.status == NotificationStatus.QUEUED:
+            return None, "Notification is already queued"
+
+        # reset to pending for reprocessing
+        updated = await self.repository.update_status(
+            notification_id,
+            NotificationStatus.PENDING,
+            retry_count=notification.retry_count + 1,
+            error_code=None,
+            next_retry_time=None,
+        )
+
+        return updated, ""

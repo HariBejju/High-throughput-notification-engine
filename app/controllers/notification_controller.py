@@ -1,4 +1,3 @@
-import uuid
 import logging
 from typing import List, Optional
 
@@ -8,7 +7,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.managers.notification_manager import NotificationManager
 from app.schemas.notification_request import NotificationCreate
-from app.schemas.notification_response import NotificationResponse, NotificationDetailResponse
+from app.schemas.notification_response import (
+    NotificationResponse,
+    NotificationDetailResponse,
+    NotificationListResponse,
+    RetryResponse,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +48,7 @@ async def create_notification(
 
 @router.get("/{notification_id}", response_model=NotificationDetailResponse)
 async def get_notification(
-    notification_id: uuid.UUID,
+    notification_id: int,
     manager: NotificationManager = Depends(get_manager),
 ):
     notification = await manager.get_notification(notification_id)
@@ -57,11 +61,12 @@ async def get_notification(
 
 # ── GET /notifications ────────────────────────────────────────────────────────
 
-@router.get("", response_model=List[NotificationDetailResponse])
+@router.get("", response_model=List[NotificationListResponse])
 async def list_notifications(
-    status: Optional[int] = Query(None, description="1=pending 2=queued 3=sent 4=failed 5=retrying"),
-    channel: Optional[int] = Query(None, description="1=email 2=sms 3=push"),
-    source_service: Optional[int] = Query(None, description="1=order 2=payment 3=shipping"),
+    status: Optional[str] = Query(None, description="pending|queued|sent|failed|retrying"),
+    channel: Optional[str] = Query(None, description="email|sms|push"),
+    source_service: Optional[str] = Query(None, description="order|payment|shipping"),
+    event_type: Optional[str] = Query(None, description="order_created|payment_failed etc"),
     limit: int = Query(20, le=100),
     offset: int = Query(0),
     manager: NotificationManager = Depends(get_manager),
@@ -70,6 +75,27 @@ async def list_notifications(
         status=status,
         channel=channel,
         source_service=source_service,
+        event_type=event_type,
         limit=limit,
         offset=offset,
+    )
+
+
+# ── POST /notifications/{id}/retry ───────────────────────────────────────────
+
+@router.post("/{notification_id}/retry", response_model=RetryResponse)
+async def retry_notification(
+    notification_id: int,
+    manager: NotificationManager = Depends(get_manager),
+):
+    notification, error = await manager.retry_notification(notification_id)
+
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+
+    return RetryResponse(
+        id=notification.id,
+        status="pending",
+        retry_count=notification.retry_count,
+        message="Notification requeued successfully",
     )
