@@ -1,0 +1,26 @@
+# API
+fastapi[standard]==0.115.12
+uvicorn==0.34.0
+
+# Database
+sqlalchemy==2.0.48
+asyncpg==0.31.0
+alembic==1.14.1
+
+# Redis
+redis==5.2.1
+
+# RabbitMQ
+aio-pika==9.5.4
+
+# Config
+python-dotenv==1.1.0
+pydantic-settings==2.8.1
+
+# Circuit breaker
+circuitbreaker==2.0.0
+
+# Testing
+pytest==8.3.5
+pytest-asyncio==0.25.3
+httpx==0.28.1
