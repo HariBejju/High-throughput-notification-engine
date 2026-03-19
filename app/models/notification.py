@@ -8,20 +8,31 @@ from sqlalchemy.sql import func
 from app.database import Base
 
 
-class NotificationStatus(str, Enum):
-    PENDING  = "pending"
-    QUEUED   = "queued"
-    SENT     = "sent"
-    FAILED   = "failed"
-    RETRYING = "retrying"
+class NotificationStatus(int, Enum):
+    PENDING  = 1
+    QUEUED   = 2
+    SENT     = 3
+    FAILED   = 4
+    RETRYING = 5
+
+
+class NotificationChannel(int, Enum):
+    EMAIL = 1
+    SMS   = 2
+    PUSH  = 3
 
 
 class NotificationPriority(int, Enum):
-    # lower number = higher priority
     CRITICAL = 1   # OTP, security alerts
     HIGH     = 2   # order confirmation, payment receipt
     MEDIUM   = 3   # shipping updates
     LOW      = 4   # marketing, newsletters
+
+
+class SourceService(int, Enum):
+    ORDER    = 1
+    PAYMENT  = 2
+    SHIPPING = 3
 
 
 class Notification(Base):
@@ -31,19 +42,19 @@ class Notification(Base):
     id              = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     idempotency_key = Column(String(255), nullable=False)
 
-    # where it came from
-    source_service  = Column(String(50), nullable=False)   # order | payment | shipping
-    event_type      = Column(String(100), nullable=False)  # payment.confirmed etc
+    # where it came from — stored as integer
+    source_service  = Column(Integer, nullable=False)  # SourceService enum
+    event_type      = Column(String(100), nullable=False)
 
-    # where it goes
-    channel         = Column(String(20), nullable=False)   # email | sms | push
-    recipient       = Column(String(255), nullable=False)  # email / phone / device token
-    subject         = Column(String(500))                  # used by email only
+    # where it goes — stored as integer
+    channel         = Column(Integer, nullable=False)  # NotificationChannel enum
+    recipient       = Column(String(255), nullable=False)
+    subject         = Column(String(500))
     body            = Column(Text, nullable=False)
 
-    # priority and state
-    priority        = Column(Integer, default=NotificationPriority.MEDIUM)
-    status          = Column(String(20), default=NotificationStatus.PENDING, nullable=False)
+    # priority and state — stored as integers
+    priority        = Column(Integer, default=NotificationPriority.MEDIUM, nullable=False)
+    status          = Column(Integer, default=NotificationStatus.PENDING, nullable=False)
 
     # retry tracking
     retry_count     = Column(Integer, default=0)
@@ -52,9 +63,9 @@ class Notification(Base):
     error_message   = Column(Text)
 
     # provider response
-    external_id     = Column(String(255))  # provider message ID for tracking
+    external_id     = Column(String(255))
 
-    # flexible metadata per event type — no fixed schema needed
+    # flexible metadata — no fixed schema needed
     metadata_       = Column("metadata", JSONB, default=dict)
 
     # timestamps
@@ -63,16 +74,14 @@ class Notification(Base):
     sent_at         = Column(DateTime(timezone=True))
 
     __table_args__ = (
-        # idempotency — DB level safety net against duplicates
         UniqueConstraint("idempotency_key", name="uq_notifications_idempotency_key"),
-        # index for worker query — fetch retrying notifications efficiently
         Index("ix_notifications_worker", "status", "priority", "next_retry_at"),
     )
 
     def __repr__(self):
         return (
             f"<Notification id={self.id} "
-            f"channel={self.channel} "
-            f"status={self.status} "
-            f"priority={self.priority}>"
+            f"channel={NotificationChannel(self.channel).name} "
+            f"status={NotificationStatus(self.status).name} "
+            f"priority={NotificationPriority(self.priority).name}>"
         )
