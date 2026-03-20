@@ -1,6 +1,7 @@
-from app.schemas.notification_request import NotificationCreate
+from app.schemas.notification_request import NotificationCreate, RecipientInfo
 from app.schemas.notification_response import (
-    NotificationResponse,
+    NotificationCreatedResponse,
+    NotificationChannelStatus,
     NotificationDetailResponse,
     NotificationListResponse,
     RetryResponse,
@@ -8,7 +9,9 @@ from app.schemas.notification_response import (
 
 __all__ = [
     "NotificationCreate",
-    "NotificationResponse",
+    "RecipientInfo",
+    "NotificationCreatedResponse",
+    "NotificationChannelStatus",
     "NotificationDetailResponse",
     "NotificationListResponse",
     "RetryResponse",

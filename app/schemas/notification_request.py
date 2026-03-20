@@ -1,29 +1,27 @@
 from typing import Optional
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 from app.models.notification import (
-    NotificationChannel,
     NotificationPriority,
     SourceService,
     EventType,
+    NotificationChannel,
 )
+from app.event_channel_map import EVENT_CHANNEL_MAP, CHANNEL_RECIPIENT_FIELD
+
+
+class RecipientInfo(BaseModel):
+    email:        Optional[str] = None
+    phone:        Optional[str] = None
+    device_token: Optional[str] = None
 
 
 class NotificationCreate(BaseModel):
     idempotency_key: str
-    source_service: str        # "order" | "payment" | "shipping"
-    event_type: str            # "order_created" | "payment_failed" etc
-    channel: str               # "email" | "sms" | "push"
-    recipient: str
-    priority: str = "medium"   # "critical" | "high" | "medium" | "low"
-    content: dict              # channel specific content
-
-    @field_validator("channel")
-    @classmethod
-    def validate_channel(cls, v):
-        allowed = {c.name.lower() for c in NotificationChannel}
-        if v.lower() not in allowed:
-            raise ValueError(f"channel must be one of {allowed}")
-        return v.lower()
+    source_service:  str          # "order" | "payment" | "shipping"
+    event_type:      str          # "order_created" | "payment_failed" etc
+    priority:        str = "medium"
+    recipient:       RecipientInfo
+    content:         dict         # per channel — email/sms/push keys
 
     @field_validator("source_service")
     @classmethod
@@ -49,10 +47,37 @@ class NotificationCreate(BaseModel):
             raise ValueError(f"priority must be one of {allowed}")
         return v.lower()
 
-    # helpers to convert strings to integers for DB storage
-    def channel_as_int(self) -> int:
-        return NotificationChannel[self.channel.upper()].value
+    @model_validator(mode="after")
+    def validate_recipient_and_content(self):
+        """
+        Check that recipient has required fields for each channel
+        the event type maps to, and content has per channel data.
+        """
+        event = EventType[self.event_type.upper()]
+        channels = EVENT_CHANNEL_MAP.get(event, [])
 
+        for channel in channels:
+            # check recipient field
+            field = CHANNEL_RECIPIENT_FIELD[channel]
+            value = getattr(self.recipient, field, None)
+            if not value:
+                raise ValueError(
+                    f"recipient.{field} is required for "
+                    f"event_type={self.event_type} "
+                    f"(channel={channel.name.lower()})"
+                )
+
+            # check content has channel key
+            channel_name = channel.name.lower()
+            if channel_name not in self.content:
+                raise ValueError(
+                    f"content.{channel_name} is required for "
+                    f"event_type={self.event_type}"
+                )
+
+        return self
+
+    # helpers
     def source_service_as_int(self) -> int:
         return SourceService[self.source_service.upper()].value
 

@@ -1,11 +1,12 @@
 import logging
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 import redis.asyncio as aioredis
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.event_channel_map import EVENT_CHANNEL_MAP, CHANNEL_RECIPIENT_FIELD
 from app.models.notification import (
     Notification,
     NotificationStatus,
@@ -22,8 +23,6 @@ logger = logging.getLogger(__name__)
 IDEMPOTENCY_EXPIRY = 86400  # 24 hours
 
 redis_client = aioredis.from_url(settings.redis_url, decode_responses=True)
-
-# single shared queue instance
 queue_service = QueueService()
 
 
@@ -35,48 +34,68 @@ class NotificationManager:
 
     async def create_notification(
         self, payload: NotificationCreate
-    ) -> tuple[Optional[Notification], bool]:
-
-        # Step 1 — idempotency check via Redis
+    ) -> Tuple[List[Notification], bool]:
+        """
+        Creates one notification per channel based on EVENT_CHANNEL_MAP.
+        Returns (notifications, is_duplicate)
+        """
+        # check base idempotency key in Redis
         redis_key = f"idem:{payload.idempotency_key}"
         is_new = await redis_client.setnx(redis_key, "1")
 
         if not is_new:
             logger.info("Duplicate blocked by Redis: %s", payload.idempotency_key)
-            return None, True
+            return [], True
 
         await redis_client.expire(redis_key, IDEMPOTENCY_EXPIRY)
 
-        # Step 2 — build notification
-        notification = Notification(
-            idempotency_key=payload.idempotency_key,
-            source_service=payload.source_service_as_int(),
-            event_type=payload.event_type_as_int(),
-            channel=payload.channel_as_int(),
-            recipient=payload.recipient,
-            priority=payload.priority_as_int(),
-            status=NotificationStatus.PENDING,
-            content=payload.content,
-        )
+        # get channels for this event type
+        event = EventType[payload.event_type.upper()]
+        channels = EVENT_CHANNEL_MAP.get(event, [])
 
-        # Step 3 — persist to DB
-        try:
-            saved = await self.repository.create(notification)
-            logger.info("Notification created: %s", saved.id)
+        created = []
 
-            # Step 4 — enqueue to priority queue
-            await queue_service.enqueue(
-                notification_id=saved.id,
-                priority=saved.priority,
+        for channel in channels:
+            # generate per channel idempotency key
+            channel_idem_key = f"{payload.idempotency_key}-{channel.name.lower()}"
+
+            # get correct recipient for this channel
+            recipient_field = CHANNEL_RECIPIENT_FIELD[channel]
+            recipient = getattr(payload.recipient, recipient_field)
+
+            # get content for this channel
+            channel_content = payload.content.get(channel.name.lower(), {})
+
+            notification = Notification(
+                idempotency_key=channel_idem_key,
+                source_service=payload.source_service_as_int(),
+                event_type=payload.event_type_as_int(),
+                channel=channel.value,
+                recipient=recipient,
+                priority=payload.priority_as_int(),
+                status=NotificationStatus.PENDING,
+                content=channel_content,
             )
 
-            return saved, False
+            try:
+                saved = await self.repository.create(notification)
+                await queue_service.enqueue(
+                    notification_id=saved.id,
+                    priority=saved.priority,
+                )
+                created.append(saved)
+                logger.info(
+                    "Notification created id=%s channel=%s",
+                    saved.id, channel.name
+                )
 
-        except IntegrityError:
-            await self.db.rollback()
-            await redis_client.delete(redis_key)
-            logger.warning("Duplicate caught by DB: %s", payload.idempotency_key)
-            return None, True
+            except IntegrityError:
+                await self.db.rollback()
+                logger.warning(
+                    "Duplicate channel notification: %s", channel_idem_key
+                )
+
+        return created, False
 
     async def get_notification(self, notification_id: int) -> Optional[Notification]:
         return await self.repository.get_by_id(notification_id)
@@ -106,7 +125,7 @@ class NotificationManager:
 
     async def retry_notification(
         self, notification_id: int
-    ) -> tuple[Optional[Notification], str]:
+    ) -> Tuple[Optional[Notification], str]:
         notification = await self.repository.get_by_id(notification_id)
 
         if not notification:
@@ -126,7 +145,6 @@ class NotificationManager:
             next_retry_time=None,
         )
 
-        # re-enqueue
         await queue_service.enqueue(
             notification_id=notification_id,
             priority=notification.priority,

@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 from pydantic import BaseModel, model_validator
 from app.models.notification import (
     NotificationChannel,
@@ -18,18 +18,10 @@ def int_to_label(enum_class, value):
         return str(value)
 
 
-class NotificationResponse(BaseModel):
-    """
-    Returned after POST /notifications
-    Minimal — just enough to confirm creation
-    """
+class NotificationChannelStatus(BaseModel):
+    """Single channel notification status — used inside bulk response"""
     id: int
-    idempotency_key: str
-    source_service: str
-    event_type: str
     channel: str
-    recipient: str
-    priority: str
     status: str
     ctime: datetime
 
@@ -38,27 +30,31 @@ class NotificationResponse(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def convert_integers_to_strings(cls, data):
+    def convert(cls, data):
         if hasattr(data, "__dict__"):
-            # coming from SQLAlchemy model
             return {
                 "id": data.id,
-                "idempotency_key": data.idempotency_key,
-                "source_service": int_to_label(SourceService, data.source_service),
-                "event_type": int_to_label(EventType, data.event_type),
                 "channel": int_to_label(NotificationChannel, data.channel),
-                "recipient": data.recipient,
-                "priority": int_to_label(NotificationPriority, data.priority),
                 "status": int_to_label(NotificationStatus, data.status),
                 "ctime": data.ctime,
             }
         return data
 
 
+class NotificationCreatedResponse(BaseModel):
+    """
+    Returned after POST /notifications
+    Shows all channels that were created for this event
+    """
+    idempotency_key: str
+    event_type: str
+    notifications: List[NotificationChannelStatus]
+
+
 class NotificationDetailResponse(BaseModel):
     """
     Returned after GET /notifications/{id}
-    Full details
+    Full details of a single notification
     """
     id: int
     idempotency_key: str
@@ -82,7 +78,7 @@ class NotificationDetailResponse(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def convert_integers_to_strings(cls, data):
+    def convert(cls, data):
         if hasattr(data, "__dict__"):
             return {
                 "id": data.id,
@@ -126,7 +122,7 @@ class NotificationListResponse(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def convert_integers_to_strings(cls, data):
+    def convert(cls, data):
         if hasattr(data, "__dict__"):
             return {
                 "id": data.id,

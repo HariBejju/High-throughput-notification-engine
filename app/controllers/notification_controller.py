@@ -8,7 +8,8 @@ from app.database import get_db
 from app.managers.notification_manager import NotificationManager
 from app.schemas.notification_request import NotificationCreate
 from app.schemas.notification_response import (
-    NotificationResponse,
+    NotificationCreatedResponse,
+    NotificationChannelStatus,
     NotificationDetailResponse,
     NotificationListResponse,
     RetryResponse,
@@ -25,12 +26,12 @@ def get_manager(db: AsyncSession = Depends(get_db)) -> NotificationManager:
 
 # ── POST /notifications ───────────────────────────────────────────────────────
 
-@router.post("", response_model=NotificationResponse, status_code=201)
+@router.post("", response_model=NotificationCreatedResponse, status_code=201)
 async def create_notification(
     payload: NotificationCreate,
     manager: NotificationManager = Depends(get_manager),
 ):
-    notification, is_duplicate = await manager.create_notification(payload)
+    notifications, is_duplicate = await manager.create_notification(payload)
 
     if is_duplicate:
         raise HTTPException(
@@ -41,7 +42,14 @@ async def create_notification(
             }
         )
 
-    return notification
+    return NotificationCreatedResponse(
+        idempotency_key=payload.idempotency_key,
+        event_type=payload.event_type,
+        notifications=[
+            NotificationChannelStatus.model_validate(n)
+            for n in notifications
+        ],
+    )
 
 
 # ── GET /notifications/{id} ───────────────────────────────────────────────────
