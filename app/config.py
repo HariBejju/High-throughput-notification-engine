@@ -1,7 +1,10 @@
 from pydantic_settings import BaseSettings
+from pydantic import ConfigDict
 
 
 class Settings(BaseSettings):
+    model_config = ConfigDict(env_file=".env")
+
     # PostgreSQL
     postgres_user: str
     postgres_password: str
@@ -22,9 +25,5 @@ class Settings(BaseSettings):
     worker_count: int = 100
     max_retries: int = 3
 
-    class Config:
-        env_file = ".env"
 
-
-# single instance used everywhere in the app
 settings = Settings()

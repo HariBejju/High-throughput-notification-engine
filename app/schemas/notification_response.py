@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Optional, List
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, model_validator, ConfigDict
 from app.models.notification import (
     NotificationChannel,
     NotificationPriority,
@@ -19,14 +19,12 @@ def int_to_label(enum_class, value):
 
 
 class NotificationChannelStatus(BaseModel):
-    """Single channel notification status — used inside bulk response"""
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     channel: str
     status: str
     ctime: datetime
-
-    class Config:
-        from_attributes = True
 
     @model_validator(mode="before")
     @classmethod
@@ -42,20 +40,14 @@ class NotificationChannelStatus(BaseModel):
 
 
 class NotificationCreatedResponse(BaseModel):
-    """
-    Returned after POST /notifications
-    Shows all channels that were created for this event
-    """
     idempotency_key: str
     event_type: str
     notifications: List[NotificationChannelStatus]
 
 
 class NotificationDetailResponse(BaseModel):
-    """
-    Returned after GET /notifications/{id}
-    Full details of a single notification
-    """
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     idempotency_key: str
     source_service: str
@@ -72,9 +64,6 @@ class NotificationDetailResponse(BaseModel):
     ctime: datetime
     mtime: Optional[datetime]
     stime: Optional[datetime]
-
-    class Config:
-        from_attributes = True
 
     @model_validator(mode="before")
     @classmethod
@@ -102,10 +91,8 @@ class NotificationDetailResponse(BaseModel):
 
 
 class NotificationListResponse(BaseModel):
-    """
-    Returned after GET /notifications
-    Lighter version for list view
-    """
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     source_service: str
     event_type: str
@@ -116,9 +103,6 @@ class NotificationListResponse(BaseModel):
     retry_count: int
     ctime: datetime
     stime: Optional[datetime]
-
-    class Config:
-        from_attributes = True
 
     @model_validator(mode="before")
     @classmethod
