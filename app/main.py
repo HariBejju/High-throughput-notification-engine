@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from app.database import engine, Base
 from app.controllers.notification_controller import router as notification_router
 from app.handlers.exception_handler import register_exception_handlers
+from app.handlers.rabbitmq_handler import RabbitMQHandler
 from app.providers.email_provider import MockEmailProvider
 from app.providers.sms_provider import MockSMSProvider
 from app.providers.push_provider import MockPushProvider
@@ -21,38 +22,40 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-# initialise providers
+# providers
 providers = {
     NotificationChannel.EMAIL: MockEmailProvider(failure_rate=0.1),
     NotificationChannel.SMS:   MockSMSProvider(failure_rate=0.1),
     NotificationChannel.PUSH:  MockPushProvider(failure_rate=0.1),
 }
 
-# initialise queue
-queue = QueueService()
+# queue, workers, reaper
+queue   = QueueService()
+worker  = NotificationWorker(queue=queue, providers=providers)
+reaper  = RetryReaper(queue=queue)
 
-# initialise worker pool and reaper
-worker = NotificationWorker(queue=queue, providers=providers)
-reaper = RetryReaper(queue=queue)
+# rabbitmq consumer
+rabbitmq = RabbitMQHandler()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # startup
     logger.info("Starting notification service...")
+
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
     await worker.start()
     await reaper.start()
-    logger.info("Workers and RetryReaper started")
+    await rabbitmq.start()
 
+    logger.info("All components started successfully")
     yield
 
-    # shutdown
     logger.info("Shutting down notification service...")
     await worker.stop()
     await reaper.stop()
+    await rabbitmq.stop()
     await engine.dispose()
 
 

@@ -84,7 +84,7 @@ class Notification(Base):
     # channel specific content — subject/body/title etc
     content         = Column(JSONB, nullable=False)
 
-    ctime           = Column(DateTime(timezone=True), server_default=func.now())
+    ctime = Column(DateTime(timezone=True), default=lambda: datetime.utcnow())
     mtime           = Column(DateTime(timezone=True), onupdate=func.now())
     stime           = Column(DateTime(timezone=True), nullable=True)
 
