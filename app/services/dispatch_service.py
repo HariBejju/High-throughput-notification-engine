@@ -1,4 +1,5 @@
 import logging
+import random
 from datetime import datetime, timedelta, timezone
 from typing import Dict
 
@@ -19,60 +20,79 @@ from app.services.queue_service import QueueService
 
 logger = logging.getLogger(__name__)
 
+
 # per event type retry config
-# max_retries: how many attempts before DLQ
-# max_delay:   cap on exponential backoff in seconds
+# max_retries  ──► how many attempts before DLQ
+# max_delay    ──► cap on delay in seconds
+# use_jitter   ──► True for bulk events (thundering herd risk)
+#                  False for single user events like OTP (fast retry needed)
 RETRY_CONFIG = {
     EventType.PAYMENT_OTP_REQUESTED: {
         "max_retries": 3,
-        "max_delay": 300,       # 5 minutes — OTP expires anyway
+        "max_delay": 30,        # OTP expires in 5 min, keep retries fast
+        "use_jitter": False,    # single user, no thundering herd risk
     },
     EventType.PAYMENT_FAILED: {
         "max_retries": 7,
-        "max_delay": 3600,      # 1 hour
+        "max_delay": 3600,
+        "use_jitter": True,     # bulk, thousands of users affected simultaneously
     },
     EventType.PAYMENT_CONFIRMED: {
         "max_retries": 7,
         "max_delay": 3600,
+        "use_jitter": True,
     },
     EventType.ORDER_CREATED: {
         "max_retries": 10,
-        "max_delay": 86400,     # 24 hours
+        "max_delay": 86400,
+        "use_jitter": True,
     },
     EventType.ORDER_CANCELLED: {
         "max_retries": 10,
         "max_delay": 86400,
+        "use_jitter": True,
     },
     EventType.SHIPMENT_DISPATCHED: {
         "max_retries": 10,
         "max_delay": 86400,
+        "use_jitter": True,
     },
     EventType.SHIPMENT_DELIVERED: {
         "max_retries": 10,
         "max_delay": 86400,
+        "use_jitter": True,
     },
     EventType.SHIPMENT_DELAYED: {
         "max_retries": 7,
         "max_delay": 3600,
+        "use_jitter": True,
     },
 }
 
-# default config for any event type not in map
-DEFAULT_RETRY_CONFIG = {"max_retries": 5, "max_delay": 3600}
+DEFAULT_RETRY_CONFIG = {"max_retries": 5, "max_delay": 3600, "use_jitter": True}
 
 
-def get_retry_delay(retry_count: int, max_delay: int) -> int:
+def get_retry_delay(retry_count: int, max_delay: int, use_jitter: bool = True) -> int:
     """
-    Exponential backoff: 30 * 2^(retry-1) seconds, capped at max_delay.
-    retry 1 ──► 30s
-    retry 2 ──► 60s
-    retry 3 ──► 120s
-    retry 4 ──► 240s
-    retry 5 ──► 480s
-    ...capped at max_delay
+    Exponential backoff with optional full jitter.
+
+    use_jitter=True  ──► bulk notifications
+                         random delay across full window
+                         prevents thundering herd when provider recovers
+                         1000 retries spread across window not all at once
+
+    use_jitter=False ──► OTP and single user notifications
+                         fixed predictable delay
+                         fastest possible retry
+                         no thundering herd risk for single user
     """
-    delay = 30 * (2 ** (retry_count - 1))
-    return min(delay, max_delay)
+    base_delay = 30 * (2 ** (retry_count - 1))
+    capped = min(base_delay, max_delay)
+
+    if use_jitter:
+        return random.randint(1, capped)
+    else:
+        return capped
 
 
 class DispatchService:
@@ -107,7 +127,6 @@ class DispatchService:
             NotificationStatus.QUEUED,
         )
 
-        # check provider health
         healthy = await provider.health_check()
         if not healthy:
             logger.warning(
@@ -117,7 +136,6 @@ class DispatchService:
             await self._schedule_retry(notification, NotificationErrorCode.PROVIDER_DOWN)
             return
 
-        # send
         result = await provider.send(notification.recipient, notification.content)
 
         if result.success:
@@ -170,7 +188,8 @@ class DispatchService:
         event_type = EventType(notification.event_type)
         config = RETRY_CONFIG.get(event_type, DEFAULT_RETRY_CONFIG)
         max_retries = config["max_retries"]
-        max_delay = config["max_delay"]
+        max_delay   = config["max_delay"]
+        use_jitter  = config["use_jitter"]
 
         new_retry_count = notification.retry_count + 1
 
@@ -183,7 +202,7 @@ class DispatchService:
             await self._send_to_dlq(notification, error_code)
             return
 
-        delay = get_retry_delay(new_retry_count, max_delay)
+        delay = get_retry_delay(new_retry_count, max_delay, use_jitter)
         next_retry_time = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=delay)
 
         await self.repository.update_status(
@@ -195,19 +214,15 @@ class DispatchService:
         )
 
         logger.info(
-            "Notification %s RETRYING attempt %d/%d delay=%ds error=%s",
-            notification.id, new_retry_count, max_retries, delay, error_code.name
+            "Notification %s RETRYING attempt %d/%d delay=%ds jitter=%s error=%s",
+            notification.id, new_retry_count, max_retries,
+            delay, use_jitter, error_code.name
         )
 
     async def _send_to_dlq(self, notification: Notification, error_code: NotificationErrorCode):
-        """
-        Publish exhausted notification to RabbitMQ Dead Letter Queue.
-        Ops team can inspect and manually replay from DLQ.
-        """
         try:
             import aio_pika
             import json
-            from app.config import settings
 
             connection = await aio_pika.connect_robust(settings.rabbitmq_url)
             async with connection:
@@ -234,7 +249,7 @@ class DispatchService:
                     "error_code": error_code.name.lower(),
                     "retry_count": notification.retry_count,
                     "failure_reason": f"Exhausted all retries. Last error: {error_code.name}",
-                    "failed_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+                    "failed_at": datetime.now(timezone.utc).isoformat(),
                 }
 
                 await dlq_exchange.publish(
@@ -245,11 +260,7 @@ class DispatchService:
                     ),
                     routing_key="",
                 )
-
-                logger.info(
-                    "Notification %s published to DLQ",
-                    notification.id
-                )
+                logger.info("Notification %s published to DLQ", notification.id)
 
         except Exception as e:
             logger.error("Failed to publish to DLQ: %s", e)

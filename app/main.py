@@ -70,9 +70,27 @@ app.include_router(notification_router)
 register_exception_handlers(app)
 
 
-@app.get("/health", tags=["Health"])
+@app.get("/health")
 async def health():
-    return {"status": "ok"}
+    checks = {}
+    
+    # check DB
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+        checks["database"] = "ok"
+    except Exception:
+        checks["database"] = "down"
+    
+    # check Redis
+    try:
+        await redis_client.ping()
+        checks["redis"] = "ok"
+    except Exception:
+        checks["redis"] = "down"
+    
+    overall = "ok" if all(v == "ok" for v in checks.values()) else "degraded"
+    return {"status": overall, "checks": checks}
 
 
 @app.get("/health/providers", tags=["Health"])
