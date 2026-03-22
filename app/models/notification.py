@@ -4,7 +4,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.sql import func
 from sqlalchemy import DateTime
 from app.database import Base
-
+from datetime import datetime
 
 class NotificationStatus(int, Enum):
     PENDING  = 1
@@ -84,7 +84,7 @@ class Notification(Base):
     # channel specific content — subject/body/title etc
     content         = Column(JSONB, nullable=False)
 
-    ctime = Column(DateTime(timezone=True), default=lambda: datetime.utcnow())
+    ctime = Column(DateTime(timezone=True), server_default=func.now())
     mtime           = Column(DateTime(timezone=True), onupdate=func.now())
     stime           = Column(DateTime(timezone=True), nullable=True)
 
