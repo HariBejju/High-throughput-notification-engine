@@ -86,25 +86,19 @@ With queue:
 ```
 Order Service ──► Queue ──► Notification Service
 ```
-
 Benefits:
-
 * Decoupled services
 * Handles high load (834/sec)
 * Reliable (messages persist until ack)
 
 ---
-
 ## Why RabbitMQ over Kafka?
-
 ### Kafka
-
 * Designed for multiple consumers (fan-out)
 * Stores events for replay
 * Not needed here (only one consumer)
 
 ### RabbitMQ
-
 * Designed for one producer → one consumer
 * Matches notification system
 
@@ -113,11 +107,9 @@ Benefits:
 ## Key Advantages of RabbitMQ
 
 1. Priority Queue
-
 * High priority (OTP) processed before low priority
 
 2. Retry with TTL + DLX
-
 ```
 Fail → Retry Queue (TTL) → Back to Main Queue
 ```
@@ -269,160 +261,202 @@ Composite index on (status, priority, next_retry_time) . Individual indexes on c
 ---
 
 ## Retry Strategy
-
+ 
 ```mermaid
 flowchart TD
-    A[Notification fails] --> B{Event type?}
-    B -->|OTP| C[No jitter - fixed delays\n5s → 10s → 20s]
-    B -->|Bulk - Order Payment Shipping| D[Full window jitter\nRetry 1: random 15-30s\nRetry 2: random 30-60s\nRetry 3: random 60-120s]
-    C --> E[Publish to notification.retry\nwith TTL in milliseconds]
-    D --> E
-    E -->|TTL expires| F[x-dead-letter-exchange\nroutes back to main queue]
-    F --> G[Worker retries]
-    G -->|success| H[status = SENT]
-    G -->|fail and count exceeds 3| I[status = FAILED\npublish to notification.dlq]
-    G -->|fail and retryable| A
+    A[Notification fails] --> B{Retryable error?}
+    B -->|no - invalid recipient| C[status = FAILED immediately]
+    B -->|yes - timeout provider_down| D{Max retries exceeded?}
+    D -->|yes - count gt 3| E[status = FAILED\npublish to notification.dlq]
+    D -->|no| F{Event type?}
+    F -->|OTP| G[Fixed delay\n5s - 10s - 20s\nno jitter]
+    F -->|Bulk| H[Window jitter\nRetry 1: random 15-30s\nRetry 2: random 30-60s\nRetry 3: random 60-120s]
+    G --> I[Publish to notification.retry\nwith TTL = delay in ms]
+    H --> I
+    I -->|TTL expires\nx-dead-letter-exchange| J[Routes back to notification.queue]
+    J --> K[Worker picks up and retries]
+    K -->|success| L[status = SENT]
+    K -->|fail again| A
 ```
-
-### Why not simple fixed delay
-
-Fixed delay causes thundering herd. If 10,000 notifications fail simultaneously and all retry at exactly t+30s — the recovering provider gets hit with 10,000 requests at once and crashes again. This is a retry storm — retries making the problem worse not better.
-
-### Exponential backoff
-
-Base formula: 2^(retry_count - 1) seconds. Starts at 1 second — aligns with real provider p50 latency. Each retry doubles the wait. Capped at max_delay per event type.
-
-### Selective jitter
-
-OTP uses no jitter — single user event, no thundering herd risk, fastest retry needed. Bulk events (order, payment, shipping) use full window jitter — random between 1 and max_delay. Spreads 10,000 retries across the entire window instead of synchronizing them. Jitter has to be the full window — 10ms jitter on a 30s backoff does basically nothing.
-
-### Per event type retry config
-
-OTP — max 3 retries, max_delay 30 seconds, no jitter. OTP expires in 5 minutes. Retrying after expiry is pointless. Payment and shipping — max 3 retries, max_delay 1 hour, full jitter. More than 3 retries means something is fundamentally broken. Each retry adds load to a struggling system. Spend retry budget carefully.
-
-### Retry reaper design
-
-Smart dual-interval reaper. Critical notifications (OTP, priority=1) checked every 5 seconds. All others checked every 15 seconds. OTP is time-sensitive — 14 second delay from reaper timing is unacceptable for payment flows. Other notifications are not time-sensitive.
-
-### Polling vs Redis keyspace notifications vs RabbitMQ DLQ TTL
-
-Polling reaper — simple, reliable, predictable. Adequate for 50,000/min where retry volume is low. Effective retry granularity equals reaper interval.
-
-Redis keyspace notifications — precise timing, fires exactly when TTL expires. BUT Redis documentation explicitly warns that expiry notifications can be delayed under high key volume. Additionally pub/sub means all horizontal instances receive the same event — same notification retried by multiple workers simultaneously.
-
-RabbitMQ DLQ TTL — precise, reliable, scales horizontally naturally. Best approach for 10x+ scale. At current 50,000/min the polling reaper query touches only ~500 rows every 15 seconds — trivial for PostgreSQL with proper index.
-
-Decision — polling reaper for current scale. RabbitMQ DLQ TTL as the upgrade path when scaling beyond 500,000/min.
-
-### About p50 and reaper interval
-
-p50 based delays only work with precise scheduling. Our polling reaper has 15 second granularity — making 1-2 second delays irrelevant. Effective minimum retry delay equals the reaper interval. The delay calculation still matters for jitter — spreading retries across a time window even if the minimum is 15 seconds.
-
+ 
+### Why fixed delay does not work — thundering herd
+ 
+Say SMS provider goes down. 10,000 notifications fail simultaneously. With fixed 30 second delay — all 10,000 retry at exactly t+30s. Provider just recovered — gets hit with 10,000 requests at once and crashes again. Retries made the problem worse. This is called a retry storm.
+ 
+### Why exponential backoff alone is not enough
+ 
+Pure exponential backoff without jitter still synchronizes retries. All 10,000 failures happened at the same time. They all compute the same delay. They all retry at the same time. Same thundering herd, just delayed.
+ 
+### Why we use window jitter
+ 
+Jitter adds randomness to spread retries across a time window. Each retry level has its own distinct window — no overlap between levels:
+ 
+```
+Retry 1 ──► random between 15 and 30 seconds
+Retry 2 ──► random between 30 and 60 seconds
+Retry 3 ──► random between 60 and 120 seconds
+```
+ 
+10,000 failures spread randomly across their window. Provider sees a steady trickle instead of a spike. This is full window jitter — not 10ms of randomness on a 30 second delay which does practically nothing.
+ 
+### Why OTP uses no jitter
+ 
+Jitter is only needed when many notifications fail simultaneously — bulk events like order confirmation or payment alert where thousands of users are affected at once. OTP is one user, one notification. No thundering herd risk. Adding jitter to OTP adds unnecessary delay to a time-critical payment flow. OTP expires in 5 minutes — every second matters.
+ 
+### Why max 3 retries
+ 
+More than 3 retries means something is fundamentally broken — not a transient blip. Each retry adds load to an already struggling system. After 3 failures route to DLQ and alert ops team. Let them investigate and manually replay once the underlying issue is resolved.
+ 
+### Why polling reaper does not work
+ 
+The obvious approach is a background job that polls DB every N seconds for due retries and re-enqueues them. Two problems:
+ 
+First — wasted resources. Reaper runs every 15 seconds whether there are retries due or not. 2am with zero failures — reaper still wakes up, queries DB, finds nothing, goes back to sleep. Pointless forever.
+ 
+Second — imprecise timing. If retry is due at t+16s and reaper last ran at t+15s — next run is t+30s. Notification waits 14 extra seconds unnecessarily. Effective retry granularity equals the polling interval, not the calculated delay.
+ 
+### Why not Redis keyspace notifications
+ 
+Redis TTL on a key fires an expiry event when the key expires. Subscribe to expiry events, re-enqueue when fired. Precise timing, zero polling.
+ 
+But two problems at scale. Redis documentation explicitly warns that expiry notifications can be delayed when many keys are expiring simultaneously — exactly our failure scenario. And with horizontal scaling — multiple instances subscribe to the same expiry event. Same notification gets re-enqueued by every instance simultaneously. Thundering herd inside your own system.
+ 
+### Why RabbitMQ TTL with x-dead-letter-exchange is the right answer
+ 
+When a notification fails — publish it to `notification.retry` queue with `expiration = delay_ms`. RabbitMQ holds it for exactly that duration. When TTL expires — RabbitMQ automatically routes it to `notification.exchange` via `x-dead-letter-exchange` configuration. Handler picks it up and re-enqueues to Redis priority queue. Worker dispatches again.
+ 
+```
+notification.retry queue
+    arguments:
+        x-dead-letter-exchange: notification.exchange
+        x-dead-letter-routing-key: order.retry
+```
+ 
+Zero polling. Fires precisely when delay expires. Scales horizontally — RabbitMQ delivers each message to exactly one consumer regardless of how many instances are running. No duplicate retries. No wasted resources during quiet periods.
+ 
 ---
-
+ 
 ## Tech Stack Decisions
-
+ 
 ### FastAPI over Django/Flask
-
+ 
 FastAPI is async by default — same event loop as our 200 workers. No thread blocking. At 834 req/sec async is essential. Django and Flask are synchronous — they block the thread while waiting for DB or providers. FastAPI also provides automatic request validation via Pydantic and generates Swagger docs with zero extra work.
-
+ 
 ### RabbitMQ over Kafka
-
+ 
 This is a point-to-point problem — one service (notification) consumes these events. Kafka's strength is fan-out where multiple independent services consume the same event stream. RabbitMQ has native priority queue support at broker level which Kafka lacks. RabbitMQ is simpler operationally — one Docker container vs Kafka's Zookeeper/KRaft setup. If in future other teams need the same events, or replay capability is needed for disaster recovery, migrating the ingestion layer to Kafka makes sense while keeping RabbitMQ for internal dispatch.
-
+ 
 ### Redis Sorted Set for priority queue
-
+ 
 O(log n) insert and atomic BZPOPMIN. Survives service restarts unlike in-memory queue. Multiple worker processes share it safely. Inspectable from outside — can see queue depth and contents. Score formula (priority × 10^12 + timestamp) encodes both priority and arrival order in one number — zero chance of priority collision with any real timestamp value.
-
+ 
 ### asyncio workers over OS threads
-
+ 
 Notification sending is entirely I/O bound — waiting for HTTP responses from Twilio, SES, FCM. asyncio handles thousands of concurrent in-flight requests with near-zero memory overhead. 200 OS threads would consume 1.6GB RAM. 200 async coroutines consume kilobytes.
-
+ 
 ### SQLAlchemy async over raw SQL
-
+ 
 ORM maps Python classes to DB tables — same pattern as JPA in Spring Boot. Async SQLAlchemy with asyncpg driver means DB operations never block the event loop. Connection pooling — 20 connections kept open, shared across all requests. Each notification gets its own session for transaction isolation.
-
-
-## Scaling Path
-
-50,000/min — current design, single instance, polling reaper, works perfectly.
-
-500,000/min — multiple worker instances behind shared Redis queue. Read replicas for analytics queries. PgBouncer for connection pooling.
-
-5,000,000/min — Kafka for ingestion layer (fan-out needed at this scale). RabbitMQ DLQ TTL replaces polling reaper. Table partitioning by month for PostgreSQL. Citus for horizontal DB sharding. Kubernetes HPA watching queue depth metric for autoscaling.
-
-50,000,000/min — separate microservices per channel. Email service, SMS service, Push service scale independently. Cassandra or DynamoDB for notification state at extreme write volume. Kafka for everything.
-
+ 
 ---
-
+ 
+## Event to Channel Mapping
+ 
+Rather than producers deciding which channels to notify — the notification service owns this logic via EVENT_CHANNEL_MAP. Producer sends one event. Service decides channels. Producer doesn't need to know or care about Email/SMS/Push details.
+ 
+```
+payment_otp_requested  ──► SMS only (OTP must be fast, most secure channel)
+payment_confirmed      ──► Email + Push
+payment_failed         ──► Email + SMS + Push (urgent, all channels)
+order_created          ──► Email + Push
+order_cancelled        ──► Email + Push
+shipment_dispatched    ──► Email + Push
+shipment_delivered     ──► Email + Push
+shipment_delayed       ──► Email + SMS (delay is urgent)
+```
+ 
+---
+ 
+## Scaling Path
+ 
+50,000/min — current design, single instance, polling reaper, works perfectly.
+ 
+500,000/min — multiple worker instances behind shared Redis queue. Read replicas for analytics queries. PgBouncer for connection pooling.
+ 
+5,000,000/min — Kafka for ingestion layer (fan-out needed at this scale). RabbitMQ DLQ TTL replaces polling reaper. Table partitioning by month for PostgreSQL. Citus for horizontal DB sharding. Kubernetes HPA watching queue depth metric for autoscaling.
+ 
+50,000,000/min — separate microservices per channel. Email service, SMS service, Push service scale independently. Cassandra or DynamoDB for notification state at extreme write volume. Kafka for everything.
+ 
+---
+ 
 ## Setup Instructions
-
+ 
 ### Prerequisites
-
+ 
 Docker Desktop, Python 3.12, Git.
-
+ 
 ### Clone and setup
-
+ 
 ```
 git clone <repo>
 cd notification-service
 cp .env.example .env
 ```
-
+ 
 Fill in your values in .env.
-
+ 
 ### Start infrastructure
-
+ 
 ```
 docker-compose up -d
 ```
-
+ 
 Starts PostgreSQL on 5432, Redis on 6379, RabbitMQ on 5672. RabbitMQ management UI at http://localhost:15672.
-
+ 
 ### Run migrations
-
+ 
 ```
 $env:PYTHONPATH = "."
 alembic upgrade head
 ```
-
+ 
 ### Install dependencies
-
+ 
 ```
 python -m pip install -r requirements.txt
 ```
-
+ 
 ### Start service
-
+ 
 ```
 uvicorn app.main:app --reload
 ```
-
+ 
 API docs at http://localhost:8000/docs.
-
+ 
 ### Run tests
-
+ 
 ```
 $env:PYTHONPATH = "."
 pytest
 ```
-
+ 
 ### Simulate events
-
+ 
 ```
 python scripts/publisher.py
 ```
-
+ 
 Load test:
-
+ 
 ```
 python scripts/publisher.py --load-test --count 1000
 ```
-
+ 
 ---
-
+ 
 ## APIs
-
+ 
 POST /notifications — create notification (used by consumers or direct integration).
 GET /notifications/{id} — full details of one notification.
 GET /notifications — list with filters: status, channel, source_service, event_type, limit, offset.
@@ -430,9 +464,9 @@ POST /notifications/{id}/retry — manually retry a failed notification.
 GET /health — service health check.
 GET /health/providers — circuit breaker state of each channel.
 GET /metrics — current queue depth.
-
+ 
 ---
-
+ 
 ## Future Improvements
-
+ 
 Replace polling reaper with RabbitMQ DLQ TTL for precise retry timing at higher scale. Add Redis AOF persistence so queue survives Redis restarts. Integrate real providers — AWS SES for Email, Twilio for SMS, Firebase FCM for Push. Add user preference layer — respect channel opt-outs and quiet hours. Add webhook callback so upstream services know when notification was delivered. Implement circuit breaker with retry budget — stop retrying entirely when error rate crosses 25% as described in production retry patterns. Add per-notification metrics collection to calculate real p50 latency for dynamic retry delay tuning. Kubernetes HPA watching RabbitMQ queue depth for automatic worker scaling.
