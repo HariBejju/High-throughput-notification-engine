@@ -63,8 +63,171 @@ shipment_dispatched    ──► Email + Push
 shipment_delivered     ──► Email + Push
 shipment_delayed       ──► Email + SMS (delay is urgent)
 ```
+# Notification System Design — Why Message Queue & Why RabbitMQ
 
 ---
+
+## Why do we need a Message Queue?
+
+### Without a Message Queue
+
+```
+Order Service ──► POST /notifications ──► Notification Service
+```
+
+### Problems:
+
+#### 1. Tight Coupling
+
+* If Notification Service is down → Order Service fails
+* Order/payment should not depend on notifications
+
+#### 2. No Buffer (No Load Absorption)
+
+* Peak load: ~834 events/sec
+* If Notification Service is slow → Order Service is blocked
+* System becomes unstable under traffic spikes
+
+#### 3. No Retry on Ingest
+
+* If Notification Service crashes mid-processing → event is lost
+* No delivery guarantee
+
+---
+
+## With Message Queue
+
+```
+Order Service ──► Queue ──► Notification Service
+```
+
+### Benefits:
+
+* Decoupling: Producer does not depend on consumer availability
+* Buffering: Queue absorbs spikes
+* Reliability: Messages persist until acknowledged
+* Fire-and-forget model
+
+---
+
+# Why RabbitMQ over Kafka?
+
+---
+
+## Kafka — Designed for Fan-out (Multiple Consumers)
+
+Kafka is suitable when multiple services consume the same event:
+
+```
+Order Created Event
+        │
+        ├── Notification Service
+        ├── Analytics Service
+        ├── Inventory Service
+        └── Fraud Detection
+```
+
+### Characteristics:
+
+* Distributed log system
+* Events stored for long duration
+* Each consumer reads independently
+* Supports replay
+
+### Not suitable here:
+
+* Only one consumer (Notification Service)
+* No need for replay or multiple consumers
+* Kafka’s strengths are unused
+
+---
+
+## RabbitMQ — Designed for Point-to-Point
+
+```
+Producer ──► Queue ──► Single Consumer
+```
+
+### Matches this use case:
+
+* One producer
+* One consumer
+* Message removed after acknowledgment
+
+---
+
+## Why RabbitMQ is better (Key Reasons)
+
+### 1. Native Priority Queue
+
+* RabbitMQ supports message priority at broker level
+
+Example:
+
+* OTP → Priority 1
+* Marketing → Priority 4
+
+Broker delivers higher priority messages first automatically
+
+Kafka:
+
+* No native priority
+* Requires multiple topics and custom logic
+
+---
+
+### 2. Built-in Retry using TTL and Dead Letter Exchange
+
+RabbitMQ supports:
+
+* Per-message TTL
+* Dead Letter Exchange (DLX)
+
+### Retry Flow:
+
+```
+Main Queue
+   ↓
+Worker fails
+   ↓
+Retry Queue (with TTL)
+   ↓ (after TTL expires)
+Dead Letter Exchange
+   ↓
+Back to Main Queue
+```
+
+Retry delay handled inside broker
+No scheduler or cron required
+
+Kafka:
+
+* Requires delay topics
+* Needs custom retry service
+* More operational complexity
+
+---
+
+### 3. Simpler Operational Model
+
+* Easier setup and routing
+* No partition management
+* Lower operational overhead
+
+---
+
+## Final Decision
+
+| Feature                  | RabbitMQ | Kafka |
+| ------------------------ | -------- | ----- |
+| Single consumer use case | Yes      | No    |
+| Message priority         | Native   | No    |
+| Retry with delay         | Built-in | No    |
+| Simplicity               | High     | Lower |
+| Fan-out / replay         | No       | Yes   |
+
+---
+
 
 ## Architecture
 
