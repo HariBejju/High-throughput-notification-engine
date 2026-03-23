@@ -63,171 +63,88 @@ shipment_dispatched    ──► Email + Push
 shipment_delivered     ──► Email + Push
 shipment_delayed       ──► Email + SMS (delay is urgent)
 ```
-# Notification System Design — Why Message Queue & Why RabbitMQ
+# Notification System — Message Queue & RabbitMQ (Short Version)
 
 ---
 
-## Why do we need a Message Queue?
+## Why Message Queue?
 
-### Without a Message Queue
+Without queue:
 
 ```
-Order Service ──► POST /notifications ──► Notification Service
+Order Service ──► Notification Service
 ```
 
-### Problems:
+Problems:
 
-#### 1. Tight Coupling
+* Tight coupling (notification down → order fails)
+* No buffering (traffic spikes break system)
+* No retry guarantee (failures lose events)
 
-* If Notification Service is down → Order Service fails
-* Order/payment should not depend on notifications
-
-#### 2. No Buffer (No Load Absorption)
-
-* Peak load: ~834 events/sec
-* If Notification Service is slow → Order Service is blocked
-* System becomes unstable under traffic spikes
-
-#### 3. No Retry on Ingest
-
-* If Notification Service crashes mid-processing → event is lost
-* No delivery guarantee
-
----
-
-## With Message Queue
+With queue:
 
 ```
 Order Service ──► Queue ──► Notification Service
 ```
 
-### Benefits:
+Benefits:
 
-* Decoupling: Producer does not depend on consumer availability
-* Buffering: Queue absorbs spikes
-* Reliability: Messages persist until acknowledged
-* Fire-and-forget model
-
----
-
-# Why RabbitMQ over Kafka?
+* Decoupled services
+* Handles high load (834/sec)
+* Reliable (messages persist until ack)
 
 ---
 
-## Kafka — Designed for Fan-out (Multiple Consumers)
+## Why RabbitMQ over Kafka?
 
-Kafka is suitable when multiple services consume the same event:
+### Kafka
+
+* Designed for multiple consumers (fan-out)
+* Stores events for replay
+* Not needed here (only one consumer)
+
+### RabbitMQ
+
+* Designed for one producer → one consumer
+* Matches notification system
+
+---
+
+## Key Advantages of RabbitMQ
+
+1. Priority Queue
+
+* High priority (OTP) processed before low priority
+
+2. Retry with TTL + DLX
 
 ```
-Order Created Event
-        │
-        ├── Notification Service
-        ├── Analytics Service
-        ├── Inventory Service
-        └── Fraud Detection
+Fail → Retry Queue (TTL) → Back to Main Queue
 ```
 
-### Characteristics:
+* No polling or scheduler needed
 
-* Distributed log system
-* Events stored for long duration
-* Each consumer reads independently
-* Supports replay
+3. Simpler system
 
-### Not suitable here:
+* Less complexity than Kafka
 
-* Only one consumer (Notification Service)
-* No need for replay or multiple consumers
-* Kafka’s strengths are unused
+### Notification Provider Interface
 
----
+Every provider implements BaseProvider — a Python abstract base class with three methods: channel property, send(), and health_check(). This is the Strategy Pattern. Swapping MockSMSProvider for real TwilioSMSProvider requires zero changes anywhere else in the system. New channels like WhatsApp just implement the same interface.
 
-## RabbitMQ — Designed for Point-to-Point
+### Priority Queue
 
-```
-Producer ──► Queue ──► Single Consumer
-```
+Redis Sorted Set with score = priority × 10^12 + timestamp_ms. This ensures OTP (priority=1) always processes before marketing email (priority=4). Within same priority, older notifications process first (FIFO). BZPOPMIN gives atomic pop — two workers can never get the same notification.
 
-### Matches this use case:
+### Partial Failure Handling
 
-* One producer
-* One consumer
-* Message removed after acknowledgment
+Each event creates independent notification rows per channel. payment_failed creates three rows — email, sms, push. Each has its own status, retry_count, next_retry_time. SMS failing never blocks email or push. Workers process each independently. This is the core of partial failure isolation.
+
+### Idempotency — Two Layer Protection
+
+Layer 1 — Redis SETNX on idempotency_key. Atomic, 0.1ms, blocks duplicates before they touch DB. Producer sends one base key. Service generates per-channel keys internally. Layer 2 — PostgreSQL UNIQUE constraint on idempotency_key. Safety net if Redis restarts. Both layers together guarantee exactly-once delivery regardless of network retries, RabbitMQ redelivery, or consumer crashes.
 
 ---
-
-## Why RabbitMQ is better (Key Reasons)
-
-### 1. Native Priority Queue
-
-* RabbitMQ supports message priority at broker level
-
-Example:
-
-* OTP → Priority 1
-* Marketing → Priority 4
-
-Broker delivers higher priority messages first automatically
-
-Kafka:
-
-* No native priority
-* Requires multiple topics and custom logic
-
----
-
-### 2. Built-in Retry using TTL and Dead Letter Exchange
-
-RabbitMQ supports:
-
-* Per-message TTL
-* Dead Letter Exchange (DLX)
-
-### Retry Flow:
-
-```
-Main Queue
-   ↓
-Worker fails
-   ↓
-Retry Queue (with TTL)
-   ↓ (after TTL expires)
-Dead Letter Exchange
-   ↓
-Back to Main Queue
-```
-
-Retry delay handled inside broker
-No scheduler or cron required
-
-Kafka:
-
-* Requires delay topics
-* Needs custom retry service
-* More operational complexity
-
----
-
-### 3. Simpler Operational Model
-
-* Easier setup and routing
-* No partition management
-* Lower operational overhead
-
----
-
-## Final Decision
-
-| Feature                  | RabbitMQ | Kafka |
-| ------------------------ | -------- | ----- |
-| Single consumer use case | Yes      | No    |
-| Message priority         | Native   | No    |
-| Retry with delay         | Built-in | No    |
-| Simplicity               | High     | Lower |
-| Fan-out / replay         | No       | Yes   |
-
----
-
 
 ## Architecture
 
@@ -277,23 +194,6 @@ Handler     ──► RabbitMQ consumer and exception handling
 Worker      ──► async worker pool and retry reaper
 ```
 
-### Notification Provider Interface
-
-Every provider implements BaseProvider — a Python abstract base class with three methods: channel property, send(), and health_check(). This is the Strategy Pattern. Swapping MockSMSProvider for real TwilioSMSProvider requires zero changes anywhere else in the system. New channels like WhatsApp just implement the same interface.
-
-### Priority Queue
-
-Redis Sorted Set with score = priority × 10^12 + timestamp_ms. This ensures OTP (priority=1) always processes before marketing email (priority=4). Within same priority, older notifications process first (FIFO). BZPOPMIN gives atomic pop — two workers can never get the same notification.
-
-### Partial Failure Handling
-
-Each event creates independent notification rows per channel. payment_failed creates three rows — email, sms, push. Each has its own status, retry_count, next_retry_time. SMS failing never blocks email or push. Workers process each independently. This is the core of partial failure isolation.
-
-### Idempotency — Two Layer Protection
-
-Layer 1 — Redis SETNX on idempotency_key. Atomic, 0.1ms, blocks duplicates before they touch DB. Producer sends one base key. Service generates per-channel keys internally. Layer 2 — PostgreSQL UNIQUE constraint on idempotency_key. Safety net if Redis restarts. Both layers together guarantee exactly-once delivery regardless of network retries, RabbitMQ redelivery, or consumer crashes.
-
----
 
 ## Database Design
  
