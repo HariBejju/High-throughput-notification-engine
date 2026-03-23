@@ -19,7 +19,6 @@ Build a notification service that:
 ## Functional Requirements
 
 - Accept events from Order, Payment, Shipping services via RabbitMQ
-- Each event type maps to specific channels automatically via EVENT_CHANNEL_MAP
 - Dispatch notifications via Email, SMS, Push independently per channel
 - Track full state lifecycle of every notification
 - Retry failed notifications with exponential backoff and selective jitter
