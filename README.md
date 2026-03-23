@@ -454,19 +454,62 @@ python scripts/publisher.py --load-test --count 1000
 ```
  
 ---
- 
-## APIs
- 
-POST /notifications — create notification (used by consumers or direct integration).
-GET /notifications/{id} — full details of one notification.
-GET /notifications — list with filters: status, channel, source_service, event_type, limit, offset.
-POST /notifications/{id}/retry — manually retry a failed notification.
-GET /health — service health check.
-GET /health/providers — circuit breaker state of each channel.
-GET /metrics — current queue depth.
- 
+## Notification Service API
 ---
+
+## Endpoints
+### 1. Create Notification
+```
+POST /notifications
+```
+Creates a new notification.
+---
+### 2. Get Notification by ID
+```
+GET /notifications/{id}
+```
+Returns full details of a specific notification.
+---
+### 3. List Notifications
+```
+GET /notifications
+```
+Returns a list of notifications with optional filters.
+#### Query Parameters:
+* `status` — Filter by notification status (e.g., pending, failed, sent)
+* `channel` — Filter by channel (email, SMS, push)
+* `source_service` — Originating service
+* `event_type` — Type of event
+* `limit` — Number of records to return
+* `offset` — Pagination offset
+---
+### 4. Retry Notification
+```
+POST /notifications/{id}/retry
+```
+Manually retries a failed notification.
+---
+### 5. Health Check
+```
+GET /health
+```
+Basic service health check.
+---
+### 6. Provider Health
+```
+GET /health/providers
+```
+Returns circuit breaker state for each notification channel/provider.
+---
+### 7. Metrics
+```
+GET /metrics
+```
+Returns system metrics such as:
+* Current queue depth
+* Processing stats
+---
+
  
 ## Future Improvements
- 
-Replace polling reaper with RabbitMQ DLQ TTL for precise retry timing at higher scale. Add Redis AOF persistence so queue survives Redis restarts. Integrate real providers — AWS SES for Email, Twilio for SMS, Firebase FCM for Push. Add user preference layer — respect channel opt-outs and quiet hours. Add webhook callback so upstream services know when notification was delivered. Implement circuit breaker with retry budget — stop retrying entirely when error rate crosses 25% as described in production retry patterns. Add per-notification metrics collection to calculate real p50 latency for dynamic retry delay tuning. Kubernetes HPA watching RabbitMQ queue depth for automatic worker scaling.
+Integrate real providers — AWS SES for Email, Twilio for SMS, Firebase FCM for Push. Add user preference layer — respect channel opt-outs and quiet hours. Add webhook callback so upstream services know when notification was delivered. Implement circuit breaker with retry budget — stop retrying entirely when error rate crosses 25% as described in production retry patterns. Add per-notification metrics collection to calculate real p50 latency for dynamic retry delay tuning. Kubernetes HPA watching RabbitMQ queue depth for automatic worker scaling.
