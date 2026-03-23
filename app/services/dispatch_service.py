@@ -1,8 +1,9 @@
 import logging
 import random
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Dict
 
+import aio_pika
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -20,79 +21,98 @@ from app.services.queue_service import QueueService
 
 logger = logging.getLogger(__name__)
 
+RETRY_QUEUE    = "notification.retry"
+MAIN_EXCHANGE  = "notification.exchange"
+MAIN_QUEUE     = "notification.queue"
 
 # per event type retry config
-# max_retries  ──► how many attempts before DLQ
-# max_delay    ──► cap on delay in seconds
-# use_jitter   ──► True for bulk events (thundering herd risk)
-#                  False for single user events like OTP (fast retry needed)
 RETRY_CONFIG = {
     EventType.PAYMENT_OTP_REQUESTED: {
         "max_retries": 3,
-        "max_delay": 30,        # OTP expires in 5 min, keep retries fast
-        "use_jitter": False,    # single user, no thundering herd risk
+        "base_delay":  5,      # OTP — 5s base, matches critical check interval
+        "max_delay":   30,
+        "use_jitter":  False,  # single user, no thundering herd
     },
     EventType.PAYMENT_FAILED: {
-        "max_retries": 7,
-        "max_delay": 3600,
-        "use_jitter": True,     # bulk, thousands of users affected simultaneously
+        "max_retries": 3,
+        "base_delay":  15,
+        "max_delay":   3600,
+        "use_jitter":  True,
     },
     EventType.PAYMENT_CONFIRMED: {
-        "max_retries": 7,
-        "max_delay": 3600,
-        "use_jitter": True,
+        "max_retries": 3,
+        "base_delay":  15,
+        "max_delay":   3600,
+        "use_jitter":  True,
     },
     EventType.ORDER_CREATED: {
-        "max_retries": 10,
-        "max_delay": 86400,
-        "use_jitter": True,
+        "max_retries": 3,
+        "base_delay":  15,
+        "max_delay":   3600,
+        "use_jitter":  True,
     },
     EventType.ORDER_CANCELLED: {
-        "max_retries": 10,
-        "max_delay": 86400,
-        "use_jitter": True,
+        "max_retries": 3,
+        "base_delay":  15,
+        "max_delay":   3600,
+        "use_jitter":  True,
     },
     EventType.SHIPMENT_DISPATCHED: {
-        "max_retries": 10,
-        "max_delay": 86400,
-        "use_jitter": True,
+        "max_retries": 3,
+        "base_delay":  15,
+        "max_delay":   3600,
+        "use_jitter":  True,
     },
     EventType.SHIPMENT_DELIVERED: {
-        "max_retries": 10,
-        "max_delay": 86400,
-        "use_jitter": True,
+        "max_retries": 3,
+        "base_delay":  15,
+        "max_delay":   3600,
+        "use_jitter":  True,
     },
     EventType.SHIPMENT_DELAYED: {
-        "max_retries": 7,
-        "max_delay": 3600,
-        "use_jitter": True,
+        "max_retries": 3,
+        "base_delay":  15,
+        "max_delay":   3600,
+        "use_jitter":  True,
     },
 }
 
-DEFAULT_RETRY_CONFIG = {"max_retries": 5, "max_delay": 3600, "use_jitter": True}
+DEFAULT_RETRY_CONFIG = {
+    "max_retries": 3,
+    "base_delay":  15,
+    "max_delay":   3600,
+    "use_jitter":  True,
+}
 
 
-def get_retry_delay(retry_count: int, max_delay: int, use_jitter: bool = True) -> int:
+def get_retry_delay(retry_count: int, base_delay: int, max_delay: int, use_jitter: bool) -> int:
     """
-    Exponential backoff with optional full jitter.
+    Exponential backoff with proper window jitter.
 
-    use_jitter=True  ──► bulk notifications
-                         random delay across full window
-                         prevents thundering herd when provider recovers
-                         1000 retries spread across window not all at once
+    Each retry level has its own distinct window — no overlap between levels:
 
-    use_jitter=False ──► OTP and single user notifications
-                         fixed predictable delay
-                         fastest possible retry
-                         no thundering herd risk for single user
+    bulk (base=15):
+        retry 1 ──► random(15, 30)
+        retry 2 ──► random(30, 60)
+        retry 3 ──► random(60, 120)  capped at max_delay
+
+    OTP (base=5, no jitter):
+        retry 1 ──► 5s  (fixed)
+        retry 2 ──► 10s (fixed)
+        retry 3 ──► 20s (fixed)
+
+    use_jitter=True  ──► random within window, prevents thundering herd
+    use_jitter=False ──► always returns low end of window (fastest retry for OTP)
     """
-    base_delay = 30 * (2 ** (retry_count - 1))
-    capped = min(base_delay, max_delay)
+    low  = base_delay * (2 ** (retry_count - 1))
+    high = base_delay * (2 ** retry_count)
+
+    low  = min(low, max_delay)
+    high = min(high, max_delay)
 
     if use_jitter:
-        return random.randint(1, capped)
-    else:
-        return capped
+        return random.randint(low, high)
+    return low
 
 
 class DispatchService:
@@ -123,16 +143,12 @@ class DispatchService:
             return
 
         await self.repository.update_status(
-            notification_id,
-            NotificationStatus.QUEUED,
+            notification_id, NotificationStatus.QUEUED
         )
 
         healthy = await provider.health_check()
         if not healthy:
-            logger.warning(
-                "Provider %s is down — scheduling retry for %s",
-                channel.name, notification_id
-            )
+            logger.warning("Provider %s down — scheduling retry for %s", channel.name, notification_id)
             await self._schedule_retry(notification, NotificationErrorCode.PROVIDER_DOWN)
             return
 
@@ -142,12 +158,8 @@ class DispatchService:
             await self._mark_sent(notification, result.external_id)
         else:
             error_code = NotificationErrorCode(result.error_code) if result.error_code else NotificationErrorCode.UNKNOWN
-
             if error_code not in RETRYABLE_ERROR_CODES:
-                logger.warning(
-                    "Non retryable error for %s error=%s",
-                    notification_id, error_code.name
-                )
+                logger.warning("Non retryable error for %s error=%s", notification_id, error_code.name)
                 await self._mark_failed(notification, error_code)
             else:
                 await self._schedule_retry(notification, error_code)
@@ -155,29 +167,20 @@ class DispatchService:
     async def _mark_sent(self, notification: Notification, external_id: str):
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         await self.repository.update_status(
-            notification.id,
-            NotificationStatus.SENT,
-            external_id=external_id,
-            stime=now,
+            notification.id, NotificationStatus.SENT,
+            external_id=external_id, stime=now,
         )
-        logger.info(
-            "Notification %s SENT channel=%s",
-            notification.id,
-            NotificationChannel(notification.channel).name
-        )
+        logger.info("Notification %s SENT channel=%s", notification.id, NotificationChannel(notification.channel).name)
 
     async def _mark_failed(self, notification: Notification, error_code: NotificationErrorCode):
         await self.repository.update_status(
-            notification.id,
-            NotificationStatus.FAILED,
+            notification.id, NotificationStatus.FAILED,
             error_code=error_code.value,
         )
         logger.error(
             "Notification %s FAILED permanently channel=%s error=%s retries=%d",
-            notification.id,
-            NotificationChannel(notification.channel).name,
-            error_code.name,
-            notification.retry_count,
+            notification.id, NotificationChannel(notification.channel).name,
+            error_code.name, notification.retry_count,
         )
 
     async def _schedule_retry(
@@ -188,42 +191,73 @@ class DispatchService:
         event_type = EventType(notification.event_type)
         config = RETRY_CONFIG.get(event_type, DEFAULT_RETRY_CONFIG)
         max_retries = config["max_retries"]
+        base_delay  = config["base_delay"]
         max_delay   = config["max_delay"]
         use_jitter  = config["use_jitter"]
 
         new_retry_count = notification.retry_count + 1
 
         if new_retry_count > max_retries:
-            logger.error(
-                "Notification %s exhausted %d retries — sending to DLQ",
-                notification.id, max_retries
-            )
+            logger.error("Notification %s exhausted %d retries — sending to DLQ", notification.id, max_retries)
             await self._mark_failed(notification, error_code)
             await self._send_to_dlq(notification, error_code)
             return
 
-        delay = get_retry_delay(new_retry_count, max_delay, use_jitter)
-        next_retry_time = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=delay)
+        delay = get_retry_delay(new_retry_count, base_delay, max_delay, use_jitter)
 
+        # update DB status
         await self.repository.update_status(
-            notification.id,
-            NotificationStatus.RETRYING,
+            notification.id, NotificationStatus.RETRYING,
             retry_count=new_retry_count,
             error_code=error_code.value,
-            next_retry_time=next_retry_time,
         )
+
+        # publish to RabbitMQ retry queue with TTL
+        # when TTL expires RabbitMQ routes back to main queue automatically
+        # zero polling, zero wasted resources during quiet periods
+        await self._publish_retry(notification.id, delay)
 
         logger.info(
             "Notification %s RETRYING attempt %d/%d delay=%ds jitter=%s error=%s",
-            notification.id, new_retry_count, max_retries,
-            delay, use_jitter, error_code.name
+            notification.id, new_retry_count, max_retries, delay, use_jitter, error_code.name
         )
+
+    async def _publish_retry(self, notification_id: int, delay_seconds: int):
+        """
+        Publish notification_id to retry queue with TTL = delay_seconds.
+        RabbitMQ holds it until TTL expires then routes to main queue.
+        Worker picks up and dispatches again — no polling needed.
+        """
+        try:
+            connection = await aio_pika.connect_robust(settings.rabbitmq_url)
+            async with connection:
+                channel = await connection.channel()
+
+                # retry queue — messages expire and route to main exchange
+                retry_queue = await channel.declare_queue(
+                    RETRY_QUEUE,
+                    durable=True,
+                    arguments={
+                        "x-dead-letter-exchange": MAIN_EXCHANGE,
+                        "x-dead-letter-routing-key": "order.retry",
+                    }
+                )
+
+                await channel.default_exchange.publish(
+                    aio_pika.Message(
+                        body=str(notification_id).encode(),
+                        delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+                        expiration=str(delay_seconds * 1000),  # TTL in ms
+                    ),
+                    routing_key=RETRY_QUEUE,
+                )
+
+        except Exception as e:
+            logger.error("Failed to publish retry for %s: %s", notification_id, e)
 
     async def _send_to_dlq(self, notification: Notification, error_code: NotificationErrorCode):
         try:
-            import aio_pika
             import json
-
             connection = await aio_pika.connect_robust(settings.rabbitmq_url)
             async with connection:
                 channel = await connection.channel()
@@ -233,11 +267,7 @@ class DispatchService:
                     aio_pika.ExchangeType.FANOUT,
                     durable=True,
                 )
-
-                dlq_queue = await channel.declare_queue(
-                    "notification.dlq",
-                    durable=True,
-                )
+                dlq_queue = await channel.declare_queue("notification.dlq", durable=True)
                 await dlq_queue.bind(dlq_exchange)
 
                 payload = {

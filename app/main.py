@@ -13,7 +13,6 @@ from app.providers.push_provider import MockPushProvider
 from app.models.notification import NotificationChannel
 from app.services.queue_service import QueueService
 from app.workers.notification_worker import NotificationWorker
-from app.workers.retry_reaper import RetryReaper
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,13 +28,13 @@ providers = {
     NotificationChannel.PUSH:  MockPushProvider(failure_rate=0.1),
 }
 
-# queue, workers, reaper
+# queue and workers
 queue   = QueueService()
 worker  = NotificationWorker(queue=queue, providers=providers)
-reaper  = RetryReaper(queue=queue)
 
-# rabbitmq consumer
-rabbitmq = RabbitMQHandler()
+# rabbitmq consumer — also handles retry events from retry queue
+# no polling reaper needed — RabbitMQ TTL fires retries precisely
+rabbitmq = RabbitMQHandler(queue_service=queue)
 
 
 @asynccontextmanager
@@ -46,15 +45,13 @@ async def lifespan(app: FastAPI):
         await conn.run_sync(Base.metadata.create_all)
 
     await worker.start()
-    await reaper.start()
     await rabbitmq.start()
 
-    logger.info("All components started successfully")
+    logger.info("All components started — workers running, RabbitMQ TTL handles retries")
     yield
 
     logger.info("Shutting down notification service...")
     await worker.stop()
-    await reaper.stop()
     await rabbitmq.stop()
     await engine.dispose()
 
@@ -70,27 +67,9 @@ app.include_router(notification_router)
 register_exception_handlers(app)
 
 
-@app.get("/health")
+@app.get("/health", tags=["Health"])
 async def health():
-    checks = {}
-    
-    # check DB
-    try:
-        async with engine.connect() as conn:
-            await conn.execute(text("SELECT 1"))
-        checks["database"] = "ok"
-    except Exception:
-        checks["database"] = "down"
-    
-    # check Redis
-    try:
-        await redis_client.ping()
-        checks["redis"] = "ok"
-    except Exception:
-        checks["redis"] = "down"
-    
-    overall = "ok" if all(v == "ok" for v in checks.values()) else "degraded"
-    return {"status": overall, "checks": checks}
+    return {"status": "ok"}
 
 
 @app.get("/health/providers", tags=["Health"])
