@@ -189,17 +189,11 @@ Better JSONB support for flexible content per channel. Stronger async Python eco
 
 ### Schema Design Decisions
 
-Integer backed enums for channel, status, priority, source_service, event_type. Faster index lookups — integer comparison is one CPU instruction. Smaller storage — 4 bytes vs variable length strings. Same pattern used in enterprise systems like Zoho's ProactiveStatus. Human readable labels handled in the API response layer, not the DB.
+Integer backed enums for channel, status, priority, source_service, event_type. Faster index lookups — integer comparison is one CPU instruction. Smaller storage — 4 bytes vs variable length strings. Human readable labels handled in the API response layer, not the DB.
 
 JSONB content column for channel-specific data instead of separate tables. Email needs subject and body. SMS needs only body with 160 char limit. Push needs title, body, image_url. One flexible JSONB column eliminates nulls and makes adding new channels trivial — no schema migration needed.
 
-Removed max_retries from DB — it is application config not per-row data. Storing the same value 50,000 times per minute wastes storage and is never different per row. Configurable via MAX_RETRIES in .env.
-
 Removed error_message text column — full error details go to application logs. DB stores only error_code as integer enum for retry decision logic. This separation follows the principle — DB stores state, logs store why.
-
-### Naming Conventions
-
-ctime = created time. mtime = modified time. stime = sent time. next_retry_time = when to retry next. Short, consistent, enterprise standard.
 
 ### Timestamps stored as UTC
 
@@ -207,7 +201,7 @@ All timestamps stored as UTC in PostgreSQL. Frontend converts to user's local ti
 
 ### Indexes
 
-Composite index on (status, priority, next_retry_time) — used by retry reaper query. Individual indexes on channel and event_type — used for analytics queries like "show all cancelled orders in last 5 months". Searching by integer is one CPU instruction — critical at billions of rows.
+Composite index on (status, priority, next_retry_time) . Individual indexes on channel and event_type — used for analytics queries like "show all cancelled orders in last 5 months". Searching by integer is one CPU instruction — critical at billions of rows.
 
 ---
 
