@@ -132,7 +132,39 @@ Layer 1 — Redis SETNX on idempotency_key. Atomic, 0.1ms, blocks duplicates bef
 
 ---
 
-## Database Design
+### Database Design
+Schema — notifications table
+sqlCREATE TABLE notifications (
+    id               BIGSERIAL PRIMARY KEY,
+    idempotency_key  VARCHAR(255) UNIQUE NOT NULL,
+    source_service   INTEGER NOT NULL,   -- 1=order, 2=payment, 3=shipping
+    event_type       INTEGER NOT NULL,   -- 1=order_created ... 8=shipment_delayed
+    channel          INTEGER NOT NULL,   -- 1=email, 2=sms, 3=push
+    recipient        VARCHAR(255) NOT NULL,
+    priority         INTEGER NOT NULL,   -- 1=critical, 2=high, 3=medium, 4=low
+    status           INTEGER NOT NULL,   -- 1=pending, 2=queued, 3=sent, 4=failed, 5=retrying
+    error_code       INTEGER,            -- 1=timeout, 2=provider_down, 3=rate_limited, 4=invalid_recipient, 5=invalid_token, 6=unknown
+    retry_count      INTEGER DEFAULT 0,
+    next_retry_time  TIMESTAMPTZ,
+    external_id      VARCHAR(255),       -- provider reference id e.g. Twilio message SID
+    content          JSONB NOT NULL,     -- channel specific payload
+    ctime            TIMESTAMPTZ DEFAULT NOW(),
+    mtime            TIMESTAMPTZ,
+    stime            TIMESTAMPTZ         -- sent time, set when status = SENT
+);
+
+-- indexes
+CREATE INDEX idx_notifications_status_priority ON notifications (status, priority);
+CREATE INDEX idx_notifications_channel ON notifications (channel);
+CREATE INDEX idx_notifications_event_type ON notifications (event_type);
+Content JSONB structure per channel
+jsonEmail:  { "subject": "Order confirmed", "body": "Your order #123 is confirmed." }
+SMS:    { "body": "Payment failed. Retry at zoho.com/pay" }
+Push:   { "title": "Order Confirmed", "body": "Your order is on its way" }
+Status lifecycle
+PENDING ──► QUEUED ──► SENT
+                  └──► RETRYING ──► SENT
+                              └──► FAILED ──► DLQ
 
 ### Why PostgreSQL over MongoDB
 
