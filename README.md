@@ -1,4 +1,3 @@
-
 # High Throughput Notification Engine
 
 A production-grade notification service that aggregates events from Order, Payment, and Shipping microservices and dispatches them via Email, SMS, and Push — with guaranteed delivery, priority handling, idempotency, exponential backoff with selective jitter, circuit breaking, and full audit trail.
@@ -48,42 +47,30 @@ Build a notification service that:
 
 ### HLD — System Overview
 
-```
-Order / Payment / Shipping Services
-            │
-            │ publish events (JSON)
-            ▼
-    RabbitMQ (notification.exchange — topic exchange)
-            │
-            │ routes via order.* / payment.* / shipping.*
-            ▼
-    notification.queue
-            │
-            │ consumed by
-            ▼
-    RabbitMQ Handler (FastAPI app)
-            │
-            │ idempotency check (Redis SETNX)
-            │ create notification rows (PostgreSQL)
-            │ enqueue to priority queue (Redis Sorted Set)
-            ▼
-    Redis Priority Queue
-            │
-            │ 100 async workers pull
-            ▼
-    Worker Pool
-            │
-            │ health check + send
-            ▼
-    Provider Registry
-    ├── Email (SES/SMTP)
-    ├── SMS (Twilio)
-    └── Push (FCM/APNs)
-            │
-            ├── success ──► status = SENT
-            └── failure ──► RetryReaper ──► re-enqueue after delay
-                                │
-                                └── exhausted ──► DLQ + status = FAILED
+```mermaid
+flowchart TD
+    A[Order Service] -->|publish| E
+    B[Payment Service] -->|publish| E
+    C[Shipping Service] -->|publish| E
+    E[RabbitMQ - notification.exchange - topic exchange]
+    E -->|order.* payment.* shipping.*| F[notification.queue]
+    F --> G[RabbitMQ Handler - consume and parse event]
+    G --> H{Idempotency Check - Redis SETNX + PG UNIQUE}
+    H -->|duplicate - drop| G
+    H -->|new - proceed| I[Write to PostgreSQL - status = PENDING]
+    I --> J[Enqueue to Redis Priority Sorted Set]
+    J -->|BZPOPMIN - highest priority first| K[Worker Pool - 200 async coroutines]
+    K --> L[Dispatch Service - health check + send]
+    L --> M[Email Provider]
+    L --> N[SMS Provider]
+    L --> O[Push Provider]
+    M & N & O -->|success| P[status = SENT]
+    M & N & O -->|failure - retryable| S{Max retries exceeded?}
+    M & N & O -->|failure - not retryable| R[status = FAILED]
+    S -->|yes| T[status = FAILED + publish to DLQ]
+    S -->|no| U[notification.retry queue with TTL]
+    U -->|TTL expires - x-dead-letter-exchange| F
+    T --> V[notification.dlq - Ops team]
 ```
 
 ### Worker Calculation
@@ -163,6 +150,20 @@ Composite index on (status, priority, next_retry_time) — used by retry reaper 
 ---
 
 ## Retry Strategy
+
+```mermaid
+flowchart TD
+    A[Notification fails] --> B{Event type?}
+    B -->|OTP| C[No jitter - fixed delays\n5s → 10s → 20s]
+    B -->|Bulk - Order Payment Shipping| D[Full window jitter\nRetry 1: random 15-30s\nRetry 2: random 30-60s\nRetry 3: random 60-120s]
+    C --> E[Publish to notification.retry\nwith TTL in milliseconds]
+    D --> E
+    E -->|TTL expires| F[x-dead-letter-exchange\nroutes back to main queue]
+    F --> G[Worker retries]
+    G -->|success| H[status = SENT]
+    G -->|fail and count exceeds 3| I[status = FAILED\npublish to notification.dlq]
+    G -->|fail and retryable| A
+```
 
 ### Why not simple fixed delay
 
