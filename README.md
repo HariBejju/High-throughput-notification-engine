@@ -132,9 +132,12 @@ Layer 1 — Redis SETNX on idempotency_key. Atomic, 0.1ms, blocks duplicates bef
 
 ---
 
-### Database Design
-Schema — notifications table
-sqlCREATE TABLE notifications (
+## Database Design
+ 
+### Schema — notifications table
+ 
+```sql
+CREATE TABLE notifications (
     id               BIGSERIAL PRIMARY KEY,
     idempotency_key  VARCHAR(255) UNIQUE NOT NULL,
     source_service   INTEGER NOT NULL,   -- 1=order, 2=payment, 3=shipping
@@ -152,20 +155,30 @@ sqlCREATE TABLE notifications (
     mtime            TIMESTAMPTZ,
     stime            TIMESTAMPTZ         -- sent time, set when status = SENT
 );
-
+ 
 -- indexes
 CREATE INDEX idx_notifications_status_priority ON notifications (status, priority);
 CREATE INDEX idx_notifications_channel ON notifications (channel);
 CREATE INDEX idx_notifications_event_type ON notifications (event_type);
-Content JSONB structure per channel
-jsonEmail:  { "subject": "Order confirmed", "body": "Your order #123 is confirmed." }
+```
+ 
+### Content JSONB structure per channel
+ 
+```json
+Email:  { "subject": "Order confirmed", "body": "Your order #123 is confirmed." }
 SMS:    { "body": "Payment failed. Retry at zoho.com/pay" }
 Push:   { "title": "Order Confirmed", "body": "Your order is on its way" }
-Status lifecycle
+```
+ 
+### Status lifecycle
+ 
+```
 PENDING ──► QUEUED ──► SENT
                   └──► RETRYING ──► SENT
                               └──► FAILED ──► DLQ
-
+```
+ 
+---
 ### Why PostgreSQL over MongoDB
 
 Notification state is highly structured — every notification has the same shape. ACID guarantees are essential — the entire system's reliability depends on knowing definitively whether a notification was sent or not. MongoDB's weaker transactions are unacceptable here. PostgreSQL's JSONB handles flexible per-channel content without sacrificing relational integrity.
