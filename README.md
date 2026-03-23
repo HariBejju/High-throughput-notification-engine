@@ -37,7 +37,7 @@ Build a notification service that:
 - A notification must never be sent twice for the same event
 - OTP notifications must be dispatched within seconds
 - System must recover automatically when a provider comes back online
-- Every notification must have a full audit trail
+- Priority based notifications (OTP given more priority than advertisement mails)
 - Service must be stateless and horizontally scalable
 
 ---
