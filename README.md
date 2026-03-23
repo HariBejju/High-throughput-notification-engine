@@ -40,6 +40,30 @@ Build a notification service that:
 - Priority based notifications (OTP given more priority than advertisement mails)
 - Service must be stateless and horizontally scalable
 
+
+---
+### Worker Calculation
+
+At 50,000 notifications/min = 834/sec. With average 2 channels per event = 1,668 dispatches/sec. With 100ms average provider latency each worker handles 10/sec. Workers needed = 1,668 ÷ 10 = 167 minimum. We run 200 (configurable via WORKER_COUNT in .env) to provide headroom for spikes.
+
+### How 50,000/min is handled
+
+RabbitMQ buffers incoming events. RabbitMQ handler creates DB rows and enqueues to Redis — very fast, milliseconds per event. 200 async workers pull from Redis sorted set simultaneously. Each takes ~100ms per send. Total capacity = 200 × 10 = 2,000 dispatches/sec. Queue depth stays near zero under normal load. Spikes are absorbed by Redis queue acting as a buffer.
+## Event to Channel Mapping
+
+Rather than producers deciding which channels to notify — the notification service owns this logic via EVENT_CHANNEL_MAP. Producer sends one event. Service decides channels. Producer doesn't need to know or care about Email/SMS/Push details.
+
+```
+payment_otp_requested  ──► SMS only (OTP must be fast, most secure channel)
+payment_confirmed      ──► Email + Push
+payment_failed         ──► Email + SMS + Push (urgent, all channels)
+order_created          ──► Email + Push
+order_cancelled        ──► Email + Push
+shipment_dispatched    ──► Email + Push
+shipment_delivered     ──► Email + Push
+shipment_delayed       ──► Email + SMS (delay is urgent)
+```
+
 ---
 
 ## Architecture
@@ -72,13 +96,7 @@ flowchart TD
     T --> V[notification.dlq - Ops team]
 ```
 
-### Worker Calculation
 
-At 50,000 notifications/min = 834/sec. With average 2 channels per event = 1,668 dispatches/sec. With 100ms average provider latency each worker handles 10/sec. Workers needed = 1,668 ÷ 10 = 167 minimum. We run 200 (configurable via WORKER_COUNT in .env) to provide headroom for spikes.
-
-### How 50,000/min is handled
-
-RabbitMQ buffers incoming events. RabbitMQ handler creates DB rows and enqueues to Redis — very fast, milliseconds per event. 200 async workers pull from Redis sorted set simultaneously. Each takes ~100ms per send. Total capacity = 200 × 10 = 2,000 dispatches/sec. Queue depth stays near zero under normal load. Spikes are absorbed by Redis queue acting as a buffer.
 
 ---
 
@@ -222,24 +240,6 @@ Notification sending is entirely I/O bound — waiting for HTTP responses from T
 
 ORM maps Python classes to DB tables — same pattern as JPA in Spring Boot. Async SQLAlchemy with asyncpg driver means DB operations never block the event loop. Connection pooling — 20 connections kept open, shared across all requests. Each notification gets its own session for transaction isolation.
 
----
-
-## Event to Channel Mapping
-
-Rather than producers deciding which channels to notify — the notification service owns this logic via EVENT_CHANNEL_MAP. Producer sends one event. Service decides channels. Producer doesn't need to know or care about Email/SMS/Push details.
-
-```
-payment_otp_requested  ──► SMS only (OTP must be fast, most secure channel)
-payment_confirmed      ──► Email + Push
-payment_failed         ──► Email + SMS + Push (urgent, all channels)
-order_created          ──► Email + Push
-order_cancelled        ──► Email + Push
-shipment_dispatched    ──► Email + Push
-shipment_delivered     ──► Email + Push
-shipment_delayed       ──► Email + SMS (delay is urgent)
-```
-
----
 
 ## Scaling Path
 
