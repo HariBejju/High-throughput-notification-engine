@@ -20,7 +20,20 @@ from app.services.queue_service import QueueService
 
 logger = logging.getLogger(__name__)
 
-IDEMPOTENCY_EXPIRY = 86400  # 24 hours
+# per event type idempotency key TTL
+# OTP expires in 5 minutes — no point holding key longer
+# bulk events held for 24 hours to cover producer retry windows
+IDEMPOTENCY_TTL = {
+    "payment_otp_requested": 300,    # 5 minutes
+    "payment_failed":        86400,  # 24 hours
+    "payment_confirmed":     86400,
+    "order_created":         86400,
+    "order_cancelled":       86400,
+    "shipment_dispatched":   86400,
+    "shipment_delivered":    86400,
+    "shipment_delayed":      86400,
+}
+DEFAULT_IDEMPOTENCY_TTL = 86400  # 24 hours fallback
 
 redis_client = aioredis.from_url(settings.redis_url, decode_responses=True)
 queue_service = QueueService()
@@ -38,16 +51,42 @@ class NotificationManager:
         """
         Creates one notification per channel based on EVENT_CHANNEL_MAP.
         Returns (notifications, is_duplicate)
+
+        Idempotency is two layer:
+        Layer 1 — Redis SETNX (0.1ms, blocks before DB)
+        Layer 2 — PostgreSQL UNIQUE constraint (safety net)
+
+        Edge case handled — if SETNX succeeds but DB write fails
+        (e.g. network blip), next retry finds Redis key set but no DB row.
+        We detect this and reprocess instead of silently dropping.
         """
-        # check base idempotency key in Redis
         redis_key = f"idem:{payload.idempotency_key}"
+        ttl = IDEMPOTENCY_TTL.get(payload.event_type.lower(), DEFAULT_IDEMPOTENCY_TTL)
+
         is_new = await redis_client.setnx(redis_key, "1")
 
         if not is_new:
-            logger.info("Duplicate blocked by Redis: %s", payload.idempotency_key)
-            return [], True
+            # Redis key exists — but did DB write actually succeed?
+            # If previous attempt failed after SETNX but before DB write
+            # the notification was never created — we must not silently drop
+            existing = await self.repository.get_by_idempotency_key(
+                payload.idempotency_key
+            )
+            if existing:
+                # DB row exists — genuine duplicate, drop it
+                logger.info("Duplicate blocked by Redis: %s", payload.idempotency_key)
+                return [], True
+            else:
+                # DB row missing — previous attempt failed mid-way
+                # delete Redis key and reprocess so notification is not lost
+                await redis_client.delete(redis_key)
+                await redis_client.setnx(redis_key, "1")
+                logger.warning(
+                    "Partial failure detected for %s — Redis key existed but no DB row. Reprocessing.",
+                    payload.idempotency_key
+                )
 
-        await redis_client.expire(redis_key, IDEMPOTENCY_EXPIRY)
+        await redis_client.expire(redis_key, ttl)
 
         # get channels for this event type
         event = EventType[payload.event_type.upper()]
