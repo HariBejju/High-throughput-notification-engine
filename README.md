@@ -63,6 +63,8 @@ shipment_dispatched    ──► Email + Push
 shipment_delivered     ──► Email + Push
 shipment_delayed       ──► Email + SMS (delay is urgent)
 ```
+# Notification System — Message Queue & RabbitMQ (Short Version)
+
 ---
 
 ## Why Message Queue?
