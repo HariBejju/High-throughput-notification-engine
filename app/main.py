@@ -53,6 +53,7 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down notification service...")
     await worker.stop()
     await rabbitmq.stop()
+    await queue.close_rabbitmq()
     await engine.dispose()
 
 

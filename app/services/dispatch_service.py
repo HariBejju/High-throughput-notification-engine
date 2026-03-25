@@ -21,10 +21,6 @@ from app.services.queue_service import QueueService
 
 logger = logging.getLogger(__name__)
 
-RETRY_QUEUE    = "notification.retry"
-MAIN_EXCHANGE  = "notification.exchange"
-MAIN_QUEUE     = "notification.queue"
-
 # per event type retry config
 RETRY_CONFIG = {
     EventType.PAYMENT_OTP_REQUESTED: {
@@ -198,7 +194,7 @@ class DispatchService:
         new_retry_count = notification.retry_count + 1
 
         if new_retry_count > max_retries:
-            logger.error("Notification %s exhausted %d retries — sending to DLQ", notification.id, max_retries)
+            logger.error("❌ Notification %s exhausted %d retries — sending to DLQ", notification.id, max_retries)
             await self._mark_failed(notification, error_code)
             await self._send_to_dlq(notification, error_code)
             return
@@ -215,45 +211,18 @@ class DispatchService:
         # publish to RabbitMQ retry queue with TTL
         # when TTL expires RabbitMQ routes back to main queue automatically
         # zero polling, zero wasted resources during quiet periods
-        await self._publish_retry(notification.id, delay)
+        success = await self.queue.publish_retry(notification.id, delay)
+        if not success:
+            logger.error(
+                "❌ CRITICAL: Failed to publish retry — notification %s stuck in RETRYING state",
+                notification.id
+            )
+            return
 
         logger.info(
-            "Notification %s RETRYING attempt %d/%d delay=%ds jitter=%s error=%s",
+            "⏰ Notification %s RETRYING attempt %d/%d | delay=%ds | jitter=%s | error=%s | Will auto-retry after TTL",
             notification.id, new_retry_count, max_retries, delay, use_jitter, error_code.name
         )
-
-    async def _publish_retry(self, notification_id: int, delay_seconds: int):
-        """
-        Publish notification_id to retry queue with TTL = delay_seconds.
-        RabbitMQ holds it until TTL expires then routes to main queue.
-        Worker picks up and dispatches again — no polling needed.
-        """
-        try:
-            connection = await aio_pika.connect_robust(settings.rabbitmq_url)
-            async with connection:
-                channel = await connection.channel()
-
-                # retry queue — messages expire and route to main exchange
-                retry_queue = await channel.declare_queue(
-                    RETRY_QUEUE,
-                    durable=True,
-                    arguments={
-                        "x-dead-letter-exchange": MAIN_EXCHANGE,
-                        "x-dead-letter-routing-key": "order.retry",
-                    }
-                )
-
-                await channel.default_exchange.publish(
-                    aio_pika.Message(
-                        body=str(notification_id).encode(),
-                        delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
-                        expiration=str(delay_seconds * 1000),  # TTL in ms
-                    ),
-                    routing_key=RETRY_QUEUE,
-                )
-
-        except Exception as e:
-            logger.error("Failed to publish retry for %s: %s", notification_id, e)
 
     async def _send_to_dlq(self, notification: Notification, error_code: NotificationErrorCode):
         try:
