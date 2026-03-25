@@ -212,7 +212,6 @@ CREATE TABLE notifications (
     error_code       INTEGER,            -- 1=timeout, 2=provider_down, 3=rate_limited, 4=invalid_recipient, 5=invalid_token, 6=unknown
     retry_count      INTEGER DEFAULT 0,
     next_retry_time  TIMESTAMPTZ,
-    external_id      VARCHAR(255),       -- provider reference id e.g. Twilio message SID
     content          JSONB NOT NULL,     -- channel specific payload
     ctime            TIMESTAMPTZ DEFAULT NOW(),
     mtime            TIMESTAMPTZ,
@@ -520,4 +519,4 @@ Returns system metrics such as:
 
  
 ## Future Improvements
-Integrate real providers — AWS SES for Email, Twilio for SMS, Firebase FCM for Push. Add user preference layer — respect channel opt-outs and quiet hours. Add webhook callback so upstream services know when notification was delivered. Implement circuit breaker with retry budget — stop retrying entirely when error rate crosses 25% as described in production retry patterns. Add per-notification metrics collection to calculate real p50 latency for dynamic retry delay tuning. Kubernetes HPA watching RabbitMQ queue depth for automatic worker scaling.
+Integrate real providers — AWS SES for Email, Twilio for SMS, Firebase FCM for Push. Add user preference layer — respect channel opt-outs and quiet hours. Add webhook callback so upstream services know when notification was delivered. Implement circuit breaker with retry budget — stop retrying entirely when error rate crosses 25% as described in production retry patterns.
