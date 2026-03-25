@@ -1,6 +1,14 @@
+
+
+
 # High Throughput Notification Engine
 
+System design walkthrough : https://www.youtube.com/watch?v=u4VCMDmVyqQ
+
+Code walk through: https://www.youtube.com/watch?v=LuBbQNLmaMs
+
 A production-grade notification service that aggregates events from Order, Payment, and Shipping microservices and dispatches them via Email, SMS, and Push — with guaranteed delivery, priority handling, idempotency, exponential backoff with selective jitter, circuit breaking, and full audit trail.
+
 
 ---
 
